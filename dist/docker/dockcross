@@ -1,5 +1,7 @@
 #!/bin/sh
 
+set -x
+
 DEFAULT_DOCKCROSS_IMAGE=dockcross/linux-armv5
 
 #------------------------------------------------------------------------------
