@@ -28,7 +28,7 @@ build: data
 
 root:
 	cd ../.. && $(DOCKCROSS) --image debian:testing \
-	bash -c 'DESTDIR=/work/dist/debian/root sh dist/debian/build.sh'
+	bash -c 'cd /work && DESTDIR=/work/dist/debian/root sh dist/debian/build.sh'
 
 purge: clean
 	rm -rf root
