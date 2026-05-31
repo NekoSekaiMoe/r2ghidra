@@ -15,7 +15,7 @@ if [ $? != 0 ]; then
 	apt-get -y install xz-utils git dpkg-dev pkg-config wget binutils git g++ make pkg-config flex bison unzip patch
     wget https://github.com/radareorg/radare2/releases/download/6.1.4/radare2-dev_6.1.4_arm64.deb
 	wget https://github.com/radareorg/radare2/releases/download/6.1.4/radare2_6.1.4_arm64.deb
-	dpkg -i r2/dist/debian/*/*.deb
+	dpkg -i ./*.deb
 fi
 [ -z "${DESTDIR}" ] && DESTDIR="/work/dist/debian/root"
 
