@@ -1,7 +1,5 @@
 #!/bin/sh
 
-set -eu
-
 type fakeroot > /dev/null 2>&1
 if [ $? = 0 ]; then
 FAKEROOT=fakeroot
