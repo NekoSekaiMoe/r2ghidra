@@ -13,9 +13,8 @@ if [ $? != 0 ]; then
 	# git clone --depth=1 git@github.com:radareorg/radare2 r2 || exit 1
     apt-get update
 	apt-get -y install xz-utils git dpkg-dev pkg-config wget binutils git g++ make pkg-config flex bison unzip patch
-	git clone https://github.com/radareorg/radare2 r2 --depth=1
-	git -C r2 submodule update --init --recursive
-	( cd r2 && bash sys/debian.sh ) # make -C r2/dist/debian
+    wget https://github.com/radareorg/radare2/releases/download/6.1.4/radare2-dev_6.1.4_arm64.deb
+	wget https://github.com/radareorg/radare2/releases/download/6.1.4/radare2_6.1.4_arm64.deb
 	dpkg -i r2/dist/debian/*/*.deb
 fi
 [ -z "${DESTDIR}" ] && DESTDIR="/work/dist/debian/root"
@@ -27,6 +26,8 @@ R2_LIBR_PLUGINS=`r2 -H R2_LIBR_PLUGINS`
 [ -z "${R2_LIBR_PLUGINS}" ] && R2_LIBR_PLUGINS=/usr/lib/radare2
 
 export CFLAGS=-O2
+./preconfigure
+./configure --prefix=/usr
 make R2_PLUGDIR=${R2_LIBR_PLUGINS} DESTDIR=${DESTDIR}
 
 ./configure --prefix=/usr
