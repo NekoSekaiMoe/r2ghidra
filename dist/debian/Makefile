@@ -27,7 +27,7 @@ build: data
 	${MAKE} deb
 
 root:
-	cd ../.. && $(DOCKCROSS) --image dockcross/linux-$(CROSSARCH) \
+	cd ../.. && $(DOCKCROSS) --image debian:testing \
 	bash -c 'DESTDIR=/work/dist/debian/root sh dist/debian/build.sh'
 
 purge: clean
