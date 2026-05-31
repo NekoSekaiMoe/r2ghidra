@@ -26,7 +26,7 @@ has() {
 # Command handlers
 #
 command_update_image() {
-    docker pull $FINAL_IMAGE
+    docker pull debian:sid
 }
 
 help_update_image() {
