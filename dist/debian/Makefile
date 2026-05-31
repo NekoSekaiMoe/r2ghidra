@@ -1,7 +1,7 @@
 include ./CONFIG
 
 DEPENDS=
-CROSSARCH=x64
+CROSSARCH=arm64
 PWD=$(shell pwd)
 PACKAGE_DIR?=${PWD}
 
