@@ -12,7 +12,7 @@ r2 -qv
 if [ $? != 0 ]; then
 	# git clone --depth=1 git@github.com:radareorg/radare2 r2 || exit 1
     apt-get update
-	apt-get -y install wget binutils git g++ make pkg-config flex bison unzip patch
+	apt-get -y install xz-utils dpkg-dev pkg-config wget binutils git g++ make pkg-config flex bison unzip patch
 	wget https://github.com/radareorg/radare2/archive/master.zip
 	unzip master.zip
 	mv radare2-master r2
