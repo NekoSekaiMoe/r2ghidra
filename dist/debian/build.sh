@@ -13,8 +13,8 @@ if [ $? != 0 ]; then
 	# git clone --depth=1 git@github.com:radareorg/radare2 r2 || exit 1
     apt-get update
 	apt-get -y install xz-utils git dpkg-dev pkg-config wget binutils git g++ make pkg-config flex bison unzip patch
-	git clone https://github.com/radareorg/radare2 r2
-	git submodules update --init --recursive
+	git clone https://github.com/radareorg/radare2 r2 --depth=1
+	git -C r2 submodule update --init --recursive
 	( cd r2 && bash sys/debian.sh ) # make -C r2/dist/debian
 	dpkg -i r2/dist/debian/*/*.deb
 fi
