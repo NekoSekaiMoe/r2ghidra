@@ -33,4 +33,4 @@ make R2_PLUGDIR=${R2_LIBR_PLUGINS} DESTDIR=${DESTDIR}
 ./configure --prefix=/usr
 make -j4
 strip --strip-unneeded src/core_ghidra.so
-${FAKEROOT} make install DESTDIR="${DESTDIR}"
+make install DESTDIR="${DESTDIR}"
