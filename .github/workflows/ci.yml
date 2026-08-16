@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   r2git:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04-arm
     strategy:
       fail-fast: false
     steps:
@@ -38,8 +38,15 @@ jobs:
 #    - name: Running Testsuite
 #      run: make -C test
 
+    - name: Uploading debs
+      uses: actions/upload-artifact@v7
+      with:
+        # path: radare2/dist/debian/*/*.deb r2ghidra/dist/debian/*.deb
+        name: linux-deb-aaa
+        path: dist/debian/*.deb
+        
   linux-deb:
-    runs-on: ubuntu-22.04-arm
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
     steps:
