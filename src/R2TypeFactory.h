@@ -6,6 +6,8 @@
 
 #include <type.hh>
 
+#include <unordered_map>
+
 using namespace ghidra;
 class R2Architecture;
 
@@ -14,6 +16,14 @@ private:
 	R2Architecture *arch;
 	// RParseCType *ctype;
 
+	struct CStringCacheEntry {
+		Datatype *type; // nullptr = cached resolution failure
+		std::string error;
+	};
+	// both caches live for the factory's lifetime (one decompile); Datatypes are owned by the factory
+	std::unordered_map<std::string, CStringCacheEntry> cstringCache;
+	std::unordered_map<std::string, Datatype *> lookupCache;
+
 	Datatype *queryR2Struct(const string &n, std::set<std::string> &stackTypes);
 	Datatype *queryR2Union(const string &n, std::set<std::string> &stackTypes);
 	Datatype *queryR2Base(const string &n);
@@ -21,6 +31,7 @@ private:
 	Datatype *queryR2Typedef(const string &n, std::set<std::string> &stackTypes);
 	Datatype *queryR2Function(const string &n, std::set<std::string> &stackTypes);
 	Datatype *queryR2(const string &n, std::set<std::string> &stackTypes);
+	Datatype *findByIdResolved(const string &n, uint8 id, int4 sz, std::set<std::string> &stackTypes, Datatype *r, bool resolvedBase);
 
 protected:
 	Datatype *findById(const string &n, uint8 id, int4 sz, std::set<std::string> &stackTypes);
@@ -34,6 +45,7 @@ public:
 	~R2TypeFactory() override;
 
 	Datatype *fromCString(const string &str, string *error = nullptr, std::set<std::string> *stackTypes = nullptr);
+	static std::string toCString(Datatype *type);
 };
 
 #endif //R2GHIDRA_R2TYPEFACTORY_H

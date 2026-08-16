@@ -30,27 +30,36 @@ Scope *R2Scope::buildSubScope(uint8 id, const string &nm) {
 	return new ScopeInternal(id, nm, arch);
 }
 
-static std::string hex(ut64 v) {
-	std::stringstream ss;
-	ss << "0x" << std::hex << v;
-	return ss.str ();
-}
-
-static Element *child(Element *el, const std::string &name, const std::map<std::string, std::string> &attrs = {}) {
-	auto child = new Element (el);
-	child->setName (name);
-	el->addChild (child);
-	for (const auto &attr : attrs) {
-		child->addAttribute (attr.first, attr.second);
-	}
-	return child;
-}
-
 static Element *childAddr(Element *el, const std::string &name, const Address &addr) {
-	return child(el, name, {
-		{ "space", addr.getSpace()->getName () },
-		{ "offset", hex(addr.getOffset ()) }
+	AddrSpace *space = addr.getSpace ();
+	if (space->getType () != IPTR_JOIN) {
+		return child (el, name, {
+			{ "space", space->getName () },
+			{ "offset", hex (addr.getOffset ()) }
+		});
+	}
+
+	// Join addresses must be marshaled with their physical pieces.
+	JoinRecord *record = space->getManager ()->findJoin (addr.getOffset ());
+	const int4 numPieces = record->numPieces ();
+	constexpr int4 maxMarshaledJoinPieces = 64; // JoinSpace::MAX_PIECES is private.
+	if (numPieces > maxMarshaledJoinPieces) {
+		throw LowlevelError ("Exceeded maximum pieces in one join address");
+	}
+
+	Element *result = child (el, name, {
+		{ "space", space->getName () }
 	});
+	for (int4 i = 0; i < numPieces; i++) {
+		const VarnodeData &piece = record->getPiece (i);
+		const std::string value = piece.space->getName () + ":" +
+			hex (piece.offset) + ":" + std::to_string (piece.size);
+		result->addAttribute ("piece" + std::to_string (i + 1), value);
+	}
+	if (numPieces == 1) {
+		result->addAttribute ("logicalsize", std::to_string (record->getUnified ().size));
+	}
+	return result;
 }
 
 static Element *childType(Element *el, Datatype *type) {
@@ -287,13 +296,23 @@ struct FunctionVars {
 			if (a.isInvalid ()) {
 				return;
 			}
-			uintb last = a.getOffset () + type->getSize () - 1;
-			if (last < a.getOffset ()) {
+			int4 index = var->isarg ? paramIndex (a, paramSize (var, type), var) : -1;
+			if (var->isarg && index < 0) {
+				return;
+			}
+			const int4 tsize = type->getSize ();
+			// big-endian: a sub-register-width reg arg sits in the GPR's low-order (high-address) bytes
+			Address sa = a;
+			if (var->kind == R_ANAL_VAR_KIND_REG && arch->translate->isBigEndian () && tsize > 0 && tsize < default_size) {
+				sa = a + (default_size - tsize);
+			}
+			uintb last = sa.getOffset () + tsize - 1;
+			if (last < sa.getOffset ()) {
 				arch->addWarning ("Variable " + to_string (var->name) + " extends beyond the stackframe. Try changing its type to something smaller.");
 				return;
 			}
 			bool typelock = true;
-			if (overlaps (a, last)) {
+			if (overlaps (sa, last)) {
 				arch->addWarning ("Detected overlap for variable " + to_string (var->name));
 				if (var->isarg) {
 					return;
@@ -301,13 +320,9 @@ struct FunctionVars {
 				typelock = false;
 			}
 
-			int4 index = var->isarg ? paramIndex (a, paramSize (var, type), var) : -1;
-			if (var->isarg && index < 0) {
-				return;
-			}
-			ranges.insertRange (a.getSpace (), a.getOffset (), last);
+			ranges.insertRange (sa.getSpace (), sa.getOffset (), last);
 
-			Element *symbolElement = emitSymbol (symbollistElement, var->name, type, a,
+			Element *symbolElement = emitSymbol (symbollistElement, var->name, type, sa,
 				typelock ? "true" : "false", "true", var->isarg ? "0" : "-1", index,
 				var->isarg && var->kind == R_ANAL_VAR_KIND_REG, childRegRange);
 			if (var->isarg) {
@@ -382,12 +397,15 @@ static void processFunctionSignature(
 {
 	std::vector<SigArg> sig_args;
 	int4 sig_first_vararg = -1;
+	bool explicit_proto = false;
 
 	{
 		RCoreLock core_lock (arch->getCore ());
 		Sdb *tdb = core_lock->anal->sdb_types;
 		char *fname = r_type_func_guess (tdb, fcn_name);
 		if (fname && r_type_func_exist (tdb, fname)) {
+			// a cc key marks an afs-set prototype; auto-inferred and library types have none
+			explicit_proto = sdb_const_get (tdb, ("func." + std::string (fname) + ".cc").c_str (), nullptr) != nullptr;
 			const int argc = r_type_func_args_count (tdb, fname);
 			for (int i = 0; i < argc; i++) {
 				char *arg_type = r_type_func_args_type (tdb, fname, i);
@@ -396,12 +414,13 @@ static void processFunctionSignature(
 				}
 				std::string arg_type_str = arg_type;
 				free (arg_type);
-				if (arg_type_str == "...") {
+				const char *arg_name = r_type_func_args_name (tdb, fname, i);
+				// the variadic slot is stored as `,...` so the marker lands in the name, not the type
+				if (arg_type_str == "..." || (arg_name && !strcmp (arg_name, "..."))) {
 					sig_first_vararg = i;
 					break;
 				}
 
-				const char *arg_name = r_type_func_args_name (tdb, fname, i);
 				std::string name = (R_STR_ISNOTEMPTY (arg_name))
 					? std::string (arg_name)
 					: ("arg" + to_string (i));
@@ -420,7 +439,8 @@ static void processFunctionSignature(
 		free (fname);
 	}
 
-	if (sig_args.empty ()) {
+	// a return-only prototype still needs the proto built below so its return type can be locked
+	if (sig_args.empty () && !(sig_ret_type != nullptr && explicit_proto)) {
 		return;
 	}
 
@@ -442,7 +462,8 @@ static void processFunctionSignature(
 			}
 		}
 	}
-	have_sig_proto = sig_has_structured;
+	// varargs need the full proto for call-site recovery; an explicit return type must be locked so the decompiler keeps it instead of demoting to void
+	have_sig_proto = sig_has_structured || (sig_first_vararg >= 0) || (sig_ret_type != nullptr && explicit_proto);
 	if (have_sig_proto) {
 		sig_proto = protoPieces;
 	}
@@ -513,6 +534,26 @@ static void processFunctionSignature(
 	}
 }
 #endif
+
+static bool noreturnTakesArgs(RCore *core, RAnalFunction *fcn, const char *fcn_name) {
+	RAnalVar **it;
+	R_VEC_FOREACH (&fcn->vars, it) {
+		RAnalVar *v = *it;
+		// a ppc PLT stub's TOC save lands a spurious stack arg, so only a register arg counts
+		if (v && v->isarg && v->kind == R_ANAL_VAR_KIND_REG) {
+			return true;
+		}
+	}
+	Sdb *tdb = core->anal->sdb_types;
+	char *fname = r_type_func_guess (tdb, fcn_name);
+	if (!fname) {
+		return false;
+	}
+	// args_count is 0 for both unknown and zero-arg protos, so > 0 alone tells real arg-takers apart
+	bool has_args = r_type_func_args_count (tdb, fname) > 0;
+	free (fname);
+	return has_args;
+}
 
 FunctionSymbol *R2Scope::registerFunction(RAnalFunction *fcn) const {
 	// lol globals
@@ -679,6 +720,15 @@ FunctionSymbol *R2Scope::registerFunction(RAnalFunction *fcn) const {
 			fd->getFuncProto().setPieces(sig_proto);
 		}
 	}
+	// Ghidra does active param recovery unless input is locked, so a no-arg noreturn (eg __stack_chk_fail) would otherwise get a live caller reg as a phantom arg
+	if (funcsym && fcn->is_noreturn && !noreturnTakesArgs (core, fcn, fcn_name)) {
+		if (Funcdata *fd = funcsym->getFunction ()) {
+			FuncProto &fp = fd->getFuncProto ();
+			fp.setNoReturn (true);
+			fp.clearInput ();
+			fp.setInputLock (true);
+		}
+	}
 	return funcsym;
 }
 
@@ -696,35 +746,23 @@ Symbol *R2Scope::registerFlag(RFlagItem *flag) const {
 	Datatype *type = nullptr;
 	// retrieve string from r2
 	if (flag->space && std::string (R_FLAGS_FS_STRINGS) == flag->space->name) {
-		RBinString *str = nullptr;
-		RListIter *iter;
-		void *pos;
-		r_list_foreach (core->bin->binfiles, iter, pos) {
-			auto bf = reinterpret_cast<RBinFile *>(pos);
-			RBinObject *bo = bf->bo;
-			if (!bo) {
-				continue;
-			}
-
-			void *s = ht_up_find (bo->strings_db, flag->addr, nullptr);
-			if (s) {
-				str = reinterpret_cast<RBinString *>(s);
-				break;
-			}
-		}
-		Datatype *ptype;
+		// pick the char width from the Cs string metadata (bytes per char) rather than scanning the bin string vector
 		const char *tn = "char";
-		if (str) {
-			switch (str->type) {
-			case R_STRING_TYPE_WIDE:
-				tn = "char16_t";
-				break;
-			case R_STRING_TYPE_WIDE32:
+		ut64 nbytes = 0;
+		RAnalMetaItem *mi = r_meta_get_at (core->anal, flag->addr, R_META_TYPE_STRING, &nbytes);
+		if (mi && mi->str && nbytes > 0) {
+			// mi->str is escaped, so unescape to count real chars and derive the byte width
+			char *raw = strdup (mi->str);
+			const int nchars = raw? r_str_unescape (raw): 0;
+			free (raw);
+			const ut64 cw = nchars > 0? nbytes / (nchars + 1): 1;
+			if (cw >= 4) {
 				tn = "char32_t";
-				break;
+			} else if (cw == 2) {
+				tn = "char16_t";
 			}
 		}
-		ptype = arch->types->findByName (tn);
+		Datatype *ptype = arch->types->findByName (tn);
 		int4 sz = static_cast<int4>(flag->size) / ptype->getSize ();
 		type = arch->types->getTypeArray (sz, ptype);
 		attr |= Varnode::readonly;
@@ -806,6 +844,15 @@ Symbol *R2Scope::registerGlobalVar(RFlagItem *glob, const char *type_str) const 
 	return symbol;
 }
 
+// Flags that name an external callable symbol (imports and relocation targets).
+static bool is_reloc_or_import_flag(const RFlagItem *flag) {
+	const char *n = flag->name;
+	return n && (r_str_startswith (n, "reloc.")
+		|| r_str_startswith (n, "sym.imp.")
+		|| r_str_startswith (n, "imp.")
+		|| r_str_startswith (n, "plt."));
+}
+
 Symbol *R2Scope::queryR2Absolute(ut64 addr, bool contain) const {
 	RCoreLock core (arch->getCore ());
 
@@ -822,17 +869,22 @@ Symbol *R2Scope::queryR2Absolute(ut64 addr, bool contain) const {
 		return registerFunction (fcn);
 	}
 
-	if (r_io_is_valid_offset (core->io, addr, R_PERM_X)) {
+	{
 		const RList *flags = r_flag_get_list (core->flags, addr);
 		if (flags) {
+			const bool execok = r_io_is_valid_offset (core->io, addr, R_PERM_X);
 			RListIter *iter;
 			void *pos;
 			r_list_foreach (flags, iter, pos) {
 				auto flag = reinterpret_cast<RFlagItem *>(pos);
-				if (flag->space && flag->space->name && !strcmp (flag->space->name, R_FLAGS_FS_SECTIONS)) {
+				if (flag->space && flag->space->name
+						&& (!strcmp (flag->space->name, R_FLAGS_FS_SECTIONS)
+						|| !strcmp (flag->space->name, R_FLAGS_FS_STRINGS))) {
 					continue;
 				}
-				return registerFunctionFlag (flag);
+				if (execok || is_reloc_or_import_flag (flag)) {
+					return registerFunctionFlag (flag);
+				}
 			}
 		}
 	}

@@ -11,7 +11,7 @@
 
 using namespace ghidra;
 
-std::string CompilerFromCore(RCore *core);
+std::string CompilerFromCore(RCore *core, const std::string &lang_base);
 
 template<typename T> class BaseMapper {
 	private:
@@ -49,8 +49,8 @@ class ArchMapper {
 	private:
 		const Mapper<std::string> arch;
 		const Mapper<std::string> flavor;
-		const Mapper<bool> big_endian;
 		const Mapper<ut64> bits;
+		const Mapper<bool> big_endian;
 
 	public:
 		const int minopsz;
@@ -70,12 +70,12 @@ class ArchMapper {
 			, minopsz(minopsz)
 			, maxopsz(maxopsz) {}
 
+		// language id without the compiler field; the caller appends the resolved cspec id
 		std::string Map(RCore *core) const {
 			return arch.Map(core)
 				+ ":" + (big_endian.Map(core) ? "BE" : "LE")
 				+ ":" + to_string(bits.Map(core))
-				+ ":" + flavor.Map(core)
-				+ ":" + CompilerFromCore(core);
+				+ ":" + flavor.Map(core);
 		}
 };
 
@@ -116,6 +116,21 @@ static std::string DalvikFlavorFromCore(RCore *core) {
 	return "DEX_Base";
 }
 
+static std::string PpcFlavorFromCore(RCore *core) {
+	if (r_config_get_i (core->config, "asm.bits") == 64) {
+		// A2ALT decodes isel and keeps 64-bit addressing; identical to default on non-isel ppc64
+		return "A2ALT";
+	}
+	// ppc asm.cpu only accepts ppc/vle/ps, so the EMB apuinfo cpu is reachable only via bin info
+	RBinInfo *info = r_bin_get_info (core->bin);
+	const char *cpu = info? info->cpu: NULL;
+	if (cpu && (!strcmp (cpu, "e500") || !strcmp (cpu, "e500mc") || !strcmp (cpu, "4xx"))) {
+		R_LOG_INFO ("Selecting PowerPC sleigh variant '%s' from bin info cpu", cpu);
+		return cpu;
+	}
+	return "default";
+}
+
 // keys = asm.arch values
 static const std::map<std::string, ArchMapper> arch_map = {
 	{ "x86", {
@@ -146,7 +161,12 @@ static const std::map<std::string, ArchMapper> arch_map = {
 	{ "hppa", { S("pa-risc") } },
 	{ "riscv", { S("RISCV") } },
 	{ "toy", { S("Toy") } },
-	{ "ppc", { S("PowerPC") } },
+	{ "ppc", {
+		S("PowerPC"),
+		CUSTOM_FLAVOR ((RCore *core) {
+			return PpcFlavorFromCore (core);
+		})
+	} },
 	{ "8051", { S("8051"), S("default"), B(16), E(true) }},
 	{ "6800", { S("6809"), S("default"), B(16), E(true) } },
 	{ "6801", { S("6809"), S("default"), B(16), E(true) } },
@@ -260,26 +280,121 @@ static const std::map<std::string, ArchMapper> arch_map = {
 	{ "sbpf", { S("sBPF"), S("default"), B(64), E(false) } }
 };
 
+static const std::map<std::string, std::string> compiler_alias = {
+	{ "vs", "windows" },
+	{ "msvc", "windows" },
+	{ "visual studio", "windows" },
+	{ "mach0", "macosx" },
+	{ "macos", "macosx" },
+	{ "osx", "macosx" },
+};
+
 static const std::map<std::string, std::string> compiler_map = {
 	{ "elf", "gcc" },
 	{ "pe", "windows" },
-	{ "mach0", "clang" }
+	{ "mach0", "gcc" }, // apple ABIs are SysV-based; the x86 "clang" cspec is a windows profile
 };
 
-std::string CompilerFromCore(RCore *core) {
+static const LanguageDescription *matchLanguage(const std::string &lang_id) {
+	R2Architecture::collectSpecFiles (std::cerr);
+	for (const auto &lang : R2Architecture::getLanguageDescriptions ()) {
+		if (lang.getId () == lang_id) {
+			return &lang;
+		}
+	}
+	return nullptr;
+}
+
+// resolve a hint (cspec id, name, alias or bin compiler string like "GCC: 9.2.0") to a cspec id the language really ships
+static std::string findCompilerForLanguage(RCore *core, const char *hint, const std::string &lang_id) {
+	const LanguageDescription *lang = matchLanguage (lang_id);
+	if (!strcmp (hint, "?")) {
+		if (lang != nullptr) {
+			for (int4 i = 0; i < lang->numCompilers (); i++) {
+				const CompilerTag &tag = lang->getCompiler (i);
+				r_cons_printf (core->cons, "%s  (%s)\n", tag.getId ().c_str (), tag.getName ().c_str ());
+			}
+		}
+		return std::string ("default");
+	}
+	std::string h = tolower (hint);
+	auto ali = compiler_alias.find (h);
+	if (ali != compiler_alias.end ()) {
+		h = ali->second;
+	}
+	if (lang == nullptr) {
+		return std::string ("default");
+	}
+	// x86 names its windows-clang cspec plainly "clang"; only a windows-ish hint may pick it
+	auto usable = [&h](const CompilerTag &tag) {
+		return tag.getId () != "clangwindows" || h.find ("windows") != std::string::npos;
+	};
+	for (int4 i = 0; i < lang->numCompilers (); i++) {
+		const CompilerTag &tag = lang->getCompiler (i);
+		if (usable (tag) && (tolower (tag.getId ()) == h || tolower (tag.getName ()) == h)) {
+			return tag.getId ();
+		}
+	}
+	for (int4 i = 0; i < lang->numCompilers (); i++) {
+		const CompilerTag &tag = lang->getCompiler (i);
+		if (usable (tag) && (h.find (tolower (tag.getName ())) != std::string::npos || h.find (tolower (tag.getId ())) != std::string::npos)) {
+			return tag.getId ();
+		}
+	}
+	// no match: prefer default then gcc; never the first tag blindly (x86 lists windows first)
+	for (const char *fb : { "default", "gcc" }) {
+		for (int4 i = 0; i < lang->numCompilers (); i++) {
+			if (lang->getCompiler (i).getId () == fb) {
+				return std::string (fb);
+			}
+		}
+	}
+	return lang->numCompilers () > 0? lang->getCompiler (0).getId (): std::string ("default");
+}
+
+static std::string sleighIdBaseFromCore(RCore *core) {
+	const char *arch = r_config_get (core->config, "asm.arch");
+	if (R_STR_ISEMPTY (arch)) {
+		return std::string ();
+	}
+	if (!strcmp (arch, "r2ghidra")) {
+		arch = r_config_get (core->config, "asm.cpu");
+	}
+	std::string a = arch? arch: "";
+	const size_t dot = a.find ('.');
+	if (dot != std::string::npos) {
+		a.resize (dot);
+	}
+	auto arch_it = arch_map.find (a);
+	return arch_it == arch_map.end ()? std::string (): arch_it->second.Map (core);
+}
+
+std::string findGhidraCompiler(RCore *core, const char *bin_compiler) {
+	return findCompilerForLanguage (core, bin_compiler, sleighIdBaseFromCore (core));
+}
+
+std::string CompilerFromCore(RCore *core, const std::string &lang_base) {
 	if (core == nullptr) {
 		return "gcc";
+	}
+	// an explicit r2ghidra.compiler selects the cspec; "default" defers to the binary
+	const char *want = r_config_get (core->config, "r2ghidra.compiler");
+	if (R_STR_ISNOTEMPTY (want) && strcmp (want, "default")) {
+		return findCompilerForLanguage (core, want, lang_base);
 	}
 	RBinInfo *info = r_bin_get_info (core->bin);
 	if (!info || !info->rclass) {
 		return std::string ();
 	}
+	if (R_STR_ISNOTEMPTY (info->compiler)) {
+		return findCompilerForLanguage (core, info->compiler, lang_base);
+	}
 	auto comp_it = compiler_map.find (info->rclass);
 	if (comp_it == compiler_map.end ()) {
 		return std::string ();
 	}
-
-	return comp_it->second;
+	// the container guess must still be a cspec the language really has
+	return findCompilerForLanguage (core, comp_it->second.c_str (), lang_base);
 }
 
 std::string SleighIdFromCore(RCore *core) {
@@ -301,7 +416,8 @@ std::string SleighIdFromCore(RCore *core) {
 	if (arch_it == arch_map.end ()) {
 		throw LowlevelError ("Could not match asm.arch " + std::string(arch) + " to sleigh arch.");
 	}
-	return arch_it->second.Map (core);
+	std::string base = arch_it->second.Map (core);
+	return base + ":" + CompilerFromCore (core, base);
 }
 
 int ai(RCore *core, std::string cpu, int query) {
@@ -331,7 +447,8 @@ std::string SleighIdFromSleighAsmConfig(RCore *core, const char *cpu, int bits, 
 	}
 	auto arch_it = arch_map.find(cpu);
 	if (arch_it != arch_map.end()) {
-		return arch_it->second.Map (core);
+		std::string base = arch_it->second.Map (core);
+		return base + ":" + CompilerFromCore (core, base);
 	}
 	// short form if possible
 	std::string low_cpu = tolower (cpu);

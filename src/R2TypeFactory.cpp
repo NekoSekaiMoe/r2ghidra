@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <climits>
 #include <cstdlib>
+#include <utility>
 
 // Compatibility for older radare2 versions that don't have these type kinds
 #ifndef R_TYPE_BASIC
@@ -25,7 +26,6 @@
 // - Handle declarators that need identifier placement (arrays, function pointers) when wrapping r_anal_cparse.
 // - Improve base-type signedness/alias mapping (size_t, ssize_t, uintptr_t, etc).
 // - Prefer structured r2 type APIs over raw sdb parsing when available.
-// - Add caching to avoid repeated type parsing/conversion.
 // - Drop manual libc arg typing in tests once r2 auto-applies known signatures (printf, malloc, strcmp, ...).
 #define R2G_USE_CTYPE 1
 #include "R2Utils.h"
@@ -213,6 +213,7 @@ static bool get_builtin_spec(const R2TypeFactory *factory, const std::string &na
 	bool is_bool = false;
 	bool is_wchar = false;
 	int long_count = 0;
+	int4 explicit_size = 0;
 	while (ss >> token) {
 		if (token == "const" || token == "volatile" || token == "restrict") {
 			continue;
@@ -257,9 +258,24 @@ static bool get_builtin_spec(const R2TypeFactory *factory, const std::string &na
 			is_wchar = true;
 			continue;
 		}
+		int4 tok_size = 0;
+		if (parse_bits_suffix(token, "uint", tok_size) || parse_bits_suffix(token, "ut", tok_size)) {
+			explicit_size = tok_size;
+			is_unsigned = true;
+			continue;
+		}
+		if (parse_bits_suffix(token, "int", tok_size) || parse_bits_suffix(token, "st", tok_size)) {
+			explicit_size = tok_size;
+			continue;
+		}
 		return false;
 	}
 
+	if (explicit_size > 0) {
+		spec.size = explicit_size;
+		spec.meta = is_unsigned ? TYPE_UINT : TYPE_INT;
+		return true;
+	}
 	if (is_bool) {
 		spec.size = 1;
 		spec.meta = TYPE_BOOL;
@@ -309,11 +325,28 @@ static bool get_builtin_spec(const R2TypeFactory *factory, const std::string &na
 	return false;
 }
 
+static Datatype *base_or_unknown(R2TypeFactory *factory, int4 size, type_metatype meta) {
+	Datatype *base = factory->getBase(size, meta);
+	if (!base && meta != TYPE_UNKNOWN) {
+		base = factory->getBase(size, TYPE_UNKNOWN);
+	}
+	return base;
+}
+
 static Datatype *make_typedef(R2TypeFactory *factory, Datatype *base, const std::string &name) {
 	Datatype *typedefd = factory->getTypedef(base, name, 0, 0);
 	factory->setName(typedefd, name);
 	factory->setName(base, base->getName());
 	return typedefd;
+}
+
+// sdb member parsing yields the bare function type for fn-ptrs; re-wrap TYPE_CODE as a pointer
+static Datatype *code_to_pointer(R2TypeFactory *factory, Datatype *t) {
+	if (t->getMetatype () != TYPE_CODE) {
+		return t;
+	}
+	AddrSpace *space = factory->getArch ()->getDefaultCodeSpace ();
+	return factory->getTypePointer (space->getAddrSize (), t, space->getWordSize ());
 }
 
 static std::string make_tmp_typename(const std::string &type_str) {
@@ -340,10 +373,7 @@ Datatype *R2TypeFactory::queryR2Base(const string &n) {
 		size = bits / 8;
 		meta = formatToMeta(r_type_format(sdb, n.c_str()));
 	}
-	Datatype *base = getBase(size, meta);
-	if (!base && meta != TYPE_UNKNOWN) {
-		base = getBase(size, TYPE_UNKNOWN);
-	}
+	Datatype *base = base_or_unknown(this, size, meta);
 	if (!base) {
 		return nullptr;
 	}
@@ -398,6 +428,7 @@ Datatype *R2TypeFactory::queryR2Struct(const string &n, std::set<std::string> &s
 				arch->addWarning ("Failed to match type " + memberTypeName + " of member " + memberName + " in struct " + n);
 				continue;
 			}
+			memberType = code_to_pointer (this, memberType);
 			if (elements > 0) {
 				memberType = getTypeArray (elements, memberType);
 			}
@@ -518,6 +549,7 @@ Datatype *R2TypeFactory::queryR2Union(const string &n, std::set<std::string> &st
 				arch->addWarning ("Failed to match type " + memberTypeName + " of member " + memberName + " in union " + n);
 				continue;
 			}
+			memberType = code_to_pointer (this, memberType);
 			if (elements > 0) {
 				memberType = getTypeArray (elements, memberType);
 			}
@@ -625,7 +657,9 @@ Datatype *R2TypeFactory::queryR2Function(const string &n, std::set<std::string> 
 
 	for (int i = 0; i < arg_count; i++) {
 		char *arg_type = r_type_func_args_type(sdb, n.c_str(), i);
-		if (arg_type && !strcmp(arg_type, "...")) {
+		const char *arg_name = r_type_func_args_name(sdb, n.c_str(), i);
+		// the variadic slot is stored as `,...` so the marker lands in the name, not the type
+		if ((arg_type && !strcmp(arg_type, "...")) || (arg_name && !strcmp(arg_name, "..."))) {
 			proto.firstVarArgSlot = proto.intypes.size();
 			free(arg_type);
 			continue;
@@ -639,8 +673,6 @@ Datatype *R2TypeFactory::queryR2Function(const string &n, std::set<std::string> 
 			arg = getBase(1, TYPE_UNKNOWN);
 		}
 		proto.intypes.push_back(arg);
-
-		const char *arg_name = r_type_func_args_name(sdb, n.c_str(), i);
 		proto.innames.push_back(arg_name ? arg_name : "");
 
 		if (arg_type) {
@@ -709,17 +741,21 @@ Datatype *R2TypeFactory::queryR2(const string &n, std::set<std::string> &stackTy
 	}
 }
 
-Datatype *R2TypeFactory::findById(const string &n, uint8 id, int4 sz, std::set<std::string> &stackTypes) {
+Datatype *R2TypeFactory::findByIdResolved(const string &n, uint8 id, int4 sz, std::set<std::string> &stackTypes, Datatype *r, bool resolvedBase) {
 	// resolve basic types
-	Datatype *r = TypeFactory::findById (n, id, sz);
+	if (!resolvedBase) {
+		r = TypeFactory::findById (n, id, sz);
+	}
 	if (r == nullptr && n.empty()) {
 		int4 fallback_size = (sz > 0) ? sz : 1;
 		return getBase(fallback_size, TYPE_UNKNOWN);
 	}
+	// re-parsing a name already on the resolution stack would recurse forever
+	const bool revisiting = stackTypes.find (n) != stackTypes.end ();
 	if (r == nullptr) {
 		r = queryR2 (n, stackTypes);
 	}
-	if (r == nullptr) {
+	if (r == nullptr && !revisiting) {
 		const bool needs_parse =
 			n.find('*') != std::string::npos ||
 			n.rfind("const ", 0) == 0 ||
@@ -730,6 +766,12 @@ Datatype *R2TypeFactory::findById(const string &n, uint8 id, int4 sz, std::set<s
 			n.rfind("func.", 0) == 0;
 		if (needs_parse) {
 			r = fromCString (n, nullptr, &stackTypes);
+		}
+	}
+	if (r == nullptr) {
+		BuiltinTypeSpec builtin;
+		if (get_builtin_spec (this, n, builtin)) {
+			r = base_or_unknown (this, builtin.size, builtin.meta);
 		}
 	}
 	// Fallback to a basic type if the type cannot be resolved
@@ -745,120 +787,199 @@ Datatype *R2TypeFactory::findById(const string &n, uint8 id, int4 sz, std::set<s
 	return r;
 }
 
+Datatype *R2TypeFactory::findById(const string &n, uint8 id, int4 sz, std::set<std::string> &stackTypes) {
+	return findByIdResolved (n, id, sz, stackTypes, nullptr, false);
+}
+
 // overriden call
 Datatype *R2TypeFactory::findById(const string &n, uint8 id, int4 sz) {
+	Datatype *r = TypeFactory::findById (n, id, sz);
+	if (r) {
+		return r;
+	}
+	// the slow path ignores id and only uses sz for the fallback size, so name-keyed memoization is sound for sz <= 0
+	const bool cacheable = !n.empty () && sz <= 0;
+	if (cacheable) {
+		auto it = lookupCache.find (n);
+		if (it != lookupCache.end ()) {
+			return it->second;
+		}
+	}
 	std::set<std::string> stackTypes; // to detect recursion
-	return findById (n, id, sz, stackTypes);
+	r = findByIdResolved (n, id, sz, stackTypes, r, true);
+	if (cacheable) {
+		lookupCache[n] = r;
+	}
+	return r;
 }
 
 Datatype *R2TypeFactory::fromCString(const string &str, string *error, std::set<std::string> *stackTypes) {
-	std::set<std::string> localStack;
-	std::set<std::string> *stack = stackTypes ? stackTypes : &localStack;
-	std::string type_str = normalize_ws(trim_ws(str));
-	if (type_str.empty()) {
+	std::string key = normalize_ws (trim_ws (str));
+	if (key.empty ()) {
 		return nullptr;
 	}
+	auto it = cstringCache.find (key);
+	if (it != cstringCache.end ()) {
+		const CStringCacheEntry &entry = it->second;
+		if (error && !entry.type) {
+			*error = entry.error;
+		}
+		return entry.type;
+	}
+	// results computed mid-recursion may be truncated by the recursion guard, so only cache full resolutions
+	const bool toplevel = !stackTypes || stackTypes->empty ();
+	CStringCacheEntry entry{ nullptr, {} };
+	Datatype *r = nullptr;
+	std::set<std::string> localStack;
+	std::set<std::string> *stack = stackTypes ? stackTypes : &localStack;
+	const std::string &type_str = key;
 
 	if (r_str_startswith(type_str.c_str(), "func.")) {
 		std::string func_name = type_str.substr(strlen("func."));
-		Datatype *fn = queryR2Function(func_name, *stack);
-		if (fn) {
-			return fn;
-		}
+		r = queryR2Function(func_name, *stack);
 	}
 
-	auto strip_prefix = [](std::string &in, const std::string &prefix) {
-		if (in.rfind(prefix, 0) == 0) {
-			in = in.substr(prefix.size());
-			return true;
+	if (!r) {
+		auto strip_prefix = [](std::string &in, const std::string &prefix) {
+			if (in.rfind(prefix, 0) == 0) {
+				in = in.substr(prefix.size());
+				return true;
+			}
+			return false;
+		};
+
+		std::string manual = type_str;
+		int ptr_depth = 0;
+		while (!manual.empty()) {
+			manual = trim_ws(manual);
+			if (!manual.empty() && manual.back() == '*') {
+				manual.pop_back();
+				ptr_depth++;
+				continue;
+			}
+			break;
 		}
-		return false;
-	};
 
-	std::string manual = type_str;
-	int ptr_depth = 0;
-	while (!manual.empty()) {
-		manual = trim_ws(manual);
-		if (!manual.empty() && manual.back() == '*') {
-			manual.pop_back();
-			ptr_depth++;
-			continue;
+		bool stripped = true;
+		while (stripped) {
+			stripped = false;
+			stripped |= strip_prefix(manual, "const ");
+			stripped |= strip_prefix(manual, "volatile ");
 		}
-		break;
-	}
+		manual = normalize_ws(trim_ws(manual));
 
-	bool stripped = true;
-	while (stripped) {
-		stripped = false;
-		stripped |= strip_prefix(manual, "const ");
-		stripped |= strip_prefix(manual, "volatile ");
-	}
-	manual = normalize_ws(trim_ws(manual));
-
-	if (manual.rfind("struct ", 0) == 0) {
-		manual = trim_ws(manual.substr(sizeof("struct ") - 1));
-	} else if (manual.rfind("enum ", 0) == 0) {
-		manual = trim_ws(manual.substr(sizeof("enum ") - 1));
-	} else if (manual.rfind("union ", 0) == 0) {
-		manual = trim_ws(manual.substr(sizeof("union ") - 1));
-	}
-
-	Datatype *base = nullptr;
-	if (manual == "void") {
-		base = getTypeVoid();
-	} else {
-		base = findByName(manual, *stack);
-		if (!base) {
-			base = queryR2(manual, *stack);
+		if (manual.rfind("struct ", 0) == 0) {
+			manual = trim_ws(manual.substr(sizeof("struct ") - 1));
+		} else if (manual.rfind("enum ", 0) == 0) {
+			manual = trim_ws(manual.substr(sizeof("enum ") - 1));
+		} else if (manual.rfind("union ", 0) == 0) {
+			manual = trim_ws(manual.substr(sizeof("union ") - 1));
 		}
-		if (!base) {
-			BuiltinTypeSpec builtin;
-			if (get_builtin_spec(this, manual, builtin)) {
-				Datatype *builtin_base = getBase(builtin.size, builtin.meta);
-				if (!builtin_base && builtin.meta != TYPE_UNKNOWN) {
-					builtin_base = getBase(builtin.size, TYPE_UNKNOWN);
-				}
-				if (builtin_base) {
-					base = make_typedef(this, builtin_base, manual);
+
+		Datatype *base = nullptr;
+		if (manual == "void") {
+			base = getTypeVoid();
+		} else {
+			base = findByName(manual, *stack);
+			if (!base) {
+				base = queryR2(manual, *stack);
+			}
+			if (!base) {
+				BuiltinTypeSpec builtin;
+				if (get_builtin_spec(this, manual, builtin)) {
+					Datatype *builtin_base = base_or_unknown(this, builtin.size, builtin.meta);
+					if (builtin_base) {
+						base = make_typedef(this, builtin_base, manual);
+					}
 				}
 			}
 		}
-	}
-	if (base) {
-		auto space = arch->getDefaultCodeSpace();
-		Datatype *result = base;
-		for (int i = 0; i < ptr_depth; i++) {
-			result = getTypePointer(space->getAddrSize(), result, space->getWordSize());
+		if (base) {
+			auto space = arch->getDefaultCodeSpace();
+			r = base;
+			for (int i = 0; i < ptr_depth; i++) {
+				r = getTypePointer(space->getAddrSize(), r, space->getWordSize());
+			}
 		}
-		return result;
-	}
 
-	std::string parse_error;
+		if (!r) {
 #if R2G_USE_CTYPE
-	std::string tmp_name = make_tmp_typename(type_str);
-	{
-		RCoreLock core(arch->getCore());
-		if (r_type_kind(core->anal->sdb_types, tmp_name.c_str()) == R_TYPE_INVALID) {
-			std::string decl = "typedef " + type_str + " " + tmp_name + ";";
-			char *error_cstr = nullptr;
-			char *out = r_anal_cparse(core->anal, decl.c_str(), &error_cstr);
-			if (out) {
-				r_anal_save_parsed_type(core->anal, out);
-				free(out);
+			std::string tmp_name = make_tmp_typename(type_str);
+			{
+				RCoreLock core(arch->getCore());
+				if (r_type_kind(core->anal->sdb_types, tmp_name.c_str()) == R_TYPE_INVALID) {
+					std::string decl = "typedef " + type_str + " " + tmp_name + ";";
+					char *error_cstr = nullptr;
+					char *out = r_anal_cparse(core->anal, decl.c_str(), &error_cstr);
+					if (out) {
+						r_anal_save_parsed_type(core->anal, out);
+						free(out);
+					}
+					if (error_cstr) {
+						entry.error = error_cstr;
+						free(error_cstr);
+					}
+				}
 			}
-			if (error_cstr) {
-				parse_error = error_cstr;
-				free(error_cstr);
+			r = queryR2(tmp_name, *stack);
+#endif
+			if (!r && entry.error.empty()) {
+				entry.error = "Unknown type identifier " + manual;
 			}
 		}
 	}
-	Datatype *parsed = queryR2(tmp_name, *stack);
-	if (parsed) {
-		return parsed;
+
+	entry.type = r;
+	const CStringCacheEntry *result = &entry;
+	if (toplevel) {
+		auto cached = cstringCache.insert_or_assign(std::move(key), std::move(entry));
+		result = &cached.first->second;
 	}
-#endif
-	if (error) {
-		*error = !parse_error.empty() ? parse_error : "Unknown type identifier " + manual;
+	if (error && !result->type) {
+		*error = result->error;
 	}
-	return nullptr;
+	return result->type;
+}
+
+// reverse of fromCString: render a Datatype as an r2-parseable C type string, "" = not expressible
+std::string R2TypeFactory::toCString(Datatype *type) {
+	if (!type) {
+		return "";
+	}
+	if (type->getMetatype() == TYPE_VOID) {
+		return "void";
+	}
+	if (type->getSize() < 1) {
+		return "";
+	}
+	Datatype *base = type->getTypedef();
+	if (base) {
+		// keep real typedef names, but resolve our own scratch typedefs to what they alias
+		if (type->getName().compare(0, strlen("__r2ghidra_t_"), "__r2ghidra_t_") == 0) {
+			return toCString(base);
+		}
+		return type->getName();
+	}
+	switch (type->getMetatype()) {
+	case TYPE_PTR:
+	case TYPE_PTRREL: {
+		std::string inner = toCString(static_cast<TypePointer *>(type)->getPtrTo());
+		if (inner.empty()) {
+			return "";
+		}
+		return inner + (inner.back() == '*' ? "*" : " *");
+	}
+	case TYPE_INT:
+	case TYPE_UINT:
+	case TYPE_BOOL:
+	case TYPE_FLOAT:
+	case TYPE_STRUCT:
+	case TYPE_UNION:
+	case TYPE_ENUM_INT:
+	case TYPE_ENUM_UINT:
+		return type->getName();
+	default:
+		// TYPE_UNKNOWN would come back as a typelocked guess; arrays/partials/code are not expressible
+		return "";
+	}
 }

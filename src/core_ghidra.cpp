@@ -8,6 +8,8 @@
 #include "SleighAsm.h"
 #include "ArchMap.h"
 #include "PcodeFixupPreprocessor.h"
+#include "R2Utils.h"
+#include "r2harvest.h"
 #include "r2ghidra.h"
 #include <r_core.h>
 
@@ -18,7 +20,7 @@
 
 #include <libdecomp.hh>
 
-#if R2__UNIX__
+#if R2__UNIX__ && !defined(__wasi__)
 #include <errno.h>
 #include <sys/wait.h>
 #endif
@@ -27,6 +29,10 @@
 #include <mutex>
 
 #undef DEBUG_EXCEPTIONS
+
+#ifndef R_LIB_ABIVERSION
+#define R_LIB_ABIVERSION R2_ABIVERSION
+#endif
 
 typedef bool (*ConfigVarCb)(void *user, void *data);
 
@@ -55,7 +61,9 @@ public:
 
 std::vector<const ConfigVar *> ConfigVar::vars_all;
 
+std::string findGhidraCompiler(RCore *core, const char *bin_compiler);
 bool SleighHomeConfig(void *user, void *data);
+bool ConfigCompiler(void *user, void *data);
 
 #define CV static const ConfigVar
 CV cfg_var_sleighhome ("sleighhome",  "",         "SLEIGHHOME", SleighHomeConfig);
@@ -74,11 +82,28 @@ CV cfg_var_rawptr     ("rawptr",      "true",     "Show unknown globals as raw a
 CV cfg_var_verbose    ("verbose",     "false",    "Show verbose warning messages while decompiling");
 CV cfg_var_casts      ("casts",       "false",    "Show type casts where needed");
 CV cfg_var_fixups     ("fixups",      "false",    "Apply pcode fixups");
+CV cfg_var_varargs    ("varargs",     "false",    "Recover printf-family varargs from literal format strings");
+CV cfg_var_vaformats  ("varargs.formats", "",     "Extra printf-style formatters for vararg recovery (bare names, comma separated)");
 CV cfg_var_roprop     ("roprop",      "0",        "Propagate read-only constants (0,1,2,3,4)");
 CV cfg_var_timeout    ("timeout",     "0",        "Run decompilation in a separate process and kill it after a specific time");
+CV cfg_var_compiler   ("compiler",    "default",  "Select compiler for calling conventions", ConfigCompiler);
+CV cfg_var_write_vars ("write.vars",  "true",     "pdgw: write recovered variable names and types");
+CV cfg_var_write_sig  ("write.sig",   "true",     "pdgw: write the recovered function signature");
 
 
-static std::recursive_mutex decompiler_mutex;
+#ifdef __wasi__
+// wasi is single-threaded and its libc++ ships without std::recursive_mutex
+struct R2GNullMutex {
+	void lock() {}
+	void unlock() {}
+	bool try_lock() { return true; }
+};
+typedef R2GNullMutex R2GMutex;
+#else
+typedef std::recursive_mutex R2GMutex;
+#endif
+
+static R2GMutex decompiler_mutex;
 
 class DecompilerLock {
 private:
@@ -109,13 +134,18 @@ static const char* r2ghidra_help[] = {
 	"pd:gs", "", "# Display loaded Sleigh Languages (alias for pdgL)",
 	"pd:gsd", " N", "# Disassemble N instructions with Sleigh and print pcode",
 	"pd:gss", "", "# Display automatically matched Sleigh Language ID",
+	"pd:gw", "", "# Decompile and write recovered names, types and signature back into r2",
 	"pd:gx", "", "# Dump the XML of the current decompiled function",
 	"Environment:", "", "",
 	"%SLEIGHHOME" , "", "# Path to ghidra sleigh directory (same as r2ghidra.sleighhome)",
 	NULL
 };
 static void PrintUsage(const RCore *const core) {
+#if R_LIB_ABIVERSION >= 125
+	r_cons_cmd_help (core->cons, r2ghidra_help);
+#else
 	r_cons_cmd_help (core->cons, r2ghidra_help, core->print->flags & R_PRINT_FLAGS_COLOR);
+#endif
 }
 
 enum class DecompileMode {
@@ -125,7 +155,8 @@ enum class DecompileMode {
 	OFFSET,
 	STATEMENTS,
 	DISASM,
-	JSON
+	JSON,
+	WRITE
 };
 
 static void ApplyPrintCConfig(RConfig *cfg, PrintC *print_c) {
@@ -148,7 +179,39 @@ static void ApplyPrintCConfig(RConfig *cfg, PrintC *print_c) {
 	print_c->setMaxLineSize (cfg_var_linelen.GetInt (cfg));
 }
 
-static void Decompile(RCore *core, ut64 addr, DecompileMode mode, std::stringstream &out_stream, RCodeMeta **out_code) {
+static void seedGlobalPointerRegister(R2Architecture &arch, RCore *core, RAnalFunction *function) {
+	RArchConfig *acfg = core->rasm->config;
+	const char *regname = NULL;
+	ut64 value = r_config_get_i (core->config, "anal.gp");
+	if (r_str_startswith (acfg->arch, "mips")) {
+		// mips recomputes gp from t9 in the PIC prologue, so seed t9 (callee entry by ABI), not =GP
+		regname = "t9";
+		value = function->addr;
+	} else {
+		regname = r_reg_alias_getname (core->anal->reg, R_REG_ALIAS_GP);
+		if (!regname && r_str_startswith (acfg->arch, "ppc")) {
+			// ppc64 TOC base and ppc32 small-data base both live in r2
+			regname = "r2";
+		}
+	}
+	if (!regname || !value || value == UT64_MAX) {
+		return;
+	}
+	VarnodeData reg;
+	try {
+		reg = arch.translate->getRegister (regname);
+	} catch (const LowlevelError &) {
+		return;
+	}
+	AddrSpace *space = arch.getDefaultCodeSpace ();
+	ContextDatabase *cdb = arch.getContextDatabase ();
+	r_list_foreach_cpp<RAnalBlock> (function->bbs, [&](RAnalBlock *bb) {
+		TrackedSet &tset = cdb->createSet (Address (space, bb->addr), Address (space, bb->addr + bb->size));
+		tset.push_back ({ reg, value });
+	});
+}
+
+static void Decompile(RCore *core, ut64 addr, DecompileMode mode, std::stringstream &out_stream, RCodeMeta **out_code, Harvest *out_harvest = nullptr) {
 	RAnalFunction *function = r_anal_get_fcn_in (core->anal, addr, R_ANAL_FCN_TYPE_NULL);
 	if (!function) {
 		throw LowlevelError ("No function at this offset");
@@ -171,13 +234,18 @@ static void Decompile(RCore *core, ut64 addr, DecompileMode mode, std::stringstr
 	if (func == nullptr) {
 		throw LowlevelError ("No function in Scope");
 	}
+	seedGlobalPointerRegister (arch, core, function);
 	arch.getCore()->sleepBegin ();
 	auto action = arch.allacts.getCurrent ();
 
 	if (cfg_var_fixups.GetBool (core->config)) {
 		PcodeFixupPreprocessor::fixupSharedReturnJumpToRelocs(function, func, core, arch);
 	}
+	PcodeFixupPreprocessor::fixupNoreturnCallsBeforeData(function, func, core, arch);
 	PcodeFixupPreprocessor::fixupResolvedIndirectCalls(function, func, core, arch);
+	if (cfg_var_varargs.GetBool (core->config)) {
+		PcodeFixupPreprocessor::fixupVariadicFormatCalls(function, func, core, arch);
+	}
 
 	int res;
 #ifndef DEBUG_EXCEPTIONS
@@ -199,6 +267,10 @@ static void Decompile(RCore *core, ut64 addr, DecompileMode mode, std::stringstr
 		for (const auto &warning : arch.getWarnings()) {
 			func->warningHeader("[r2ghidra] " + warning);
 		}
+	}
+	if (out_harvest) {
+		HarvestFuncdata (arch, func, *out_harvest);
+		return;
 	}
 	switch (mode) {
 	case DecompileMode::XML:
@@ -278,8 +350,17 @@ static void DecompileCmd (RCore *core, DecompileMode mode) {
 #endif
 		RCodeMeta *code = nullptr;
 		std::stringstream out_stream;
-		Decompile (core, core->addr, mode, out_stream, &code);
+		Harvest harvest;
+		Decompile (core, core->addr, mode, out_stream, &code, mode == DecompileMode::WRITE ? &harvest : nullptr);
 		switch (mode) {
+		case DecompileMode::WRITE:
+			{
+				RAnalFunction *fcn = r_anal_get_fcn_in (core->anal, core->addr, R_ANAL_FCN_TYPE_NULL);
+				if (fcn) {
+					WriteHarvest (core, fcn, harvest, cfg_var_write_vars.GetBool (core->config), cfg_var_write_sig.GetBool (core->config));
+				}
+			}
+			break;
 		case DecompileMode::DISASM:
 			{
 #if defined(R2_ABIVERSION) && R2_ABIVERSION >= 40
@@ -575,6 +656,9 @@ static void runcmd(RCore *core, const char *input) {
 	case 'a': // "pdga"
 		DecompileCmd (core, DecompileMode::DISASM);
 		break;
+	case 'w': // "pdgw"
+		DecompileCmd (core, DecompileMode::WRITE);
+		break;
 	case 'p': // "pdgp"
 		EnablePlugin (core);
 		break;
@@ -586,8 +670,13 @@ static void runcmd(RCore *core, const char *input) {
 
 static void _cmd(RCore *core, const char *input) {
 	int timeout = r_config_get_i (core->config, "r2ghidra.timeout");
+	if (*input == 'w') {
+		// pdgw writes into the r2 DB; a forked child would lose the writes
+		runcmd (core, input);
+		return;
+	}
 	if (timeout > 0) {
-#if R2__UNIX__
+#if R2__UNIX__ && !defined(__wasi__)
 		// TODO: note that first execution is slower than the rest. and forking loses the cache
 		int fds[2];
 		if (pipe (fds) != 0) {
@@ -600,6 +689,7 @@ static void _cmd(RCore *core, const char *input) {
 			return;
 		}
 		if (pid == 0) {
+			close (fds[0]);
 			runcmd (core, input);
 			r_cons_flush (core->cons);
 			fflush (stdout);
@@ -613,12 +703,12 @@ static void _cmd(RCore *core, const char *input) {
 			tv.tv_usec = (timeout - (tv.tv_sec * 1000)) * 1000;
 			FD_ZERO (&rfds);
 			FD_SET (fds[0], &rfds);
+			// keeping our copy of the write end open would suppress eof from a crashed child until the timeout expires
+			close (fds[1]);
 			if (select (fds[0] + 1, &rfds, NULL, NULL, &tv) > 0) {
 				char ch = 0;
-				int rr = read (fds[0], &ch, 1);
-				if (rr > 0 && ch == 0x12) {
-					// eprintf ("Completed\n");
-					// return;
+				if (read (fds[0], &ch, 1) != 1 || ch != 0x12) {
+					R_LOG_ERROR ("Decompiler process died unexpectedly");
 				}
 			} else {
 				eprintf ("Timeout\n");
@@ -628,9 +718,8 @@ static void _cmd(RCore *core, const char *input) {
 			}
 			fflush (stderr);
 			fflush (stdout);
+			close (fds[0]);
 		}
-		close (fds[0]);
-		close (fds[1]);
 #else
 		R_LOG_WARN ("r2ghidra.timeout is not supported outside UNIX systems.");
 		runcmd (core, input);
@@ -643,7 +732,11 @@ static void _cmd(RCore *core, const char *input) {
 extern "C" bool r2ghidra_core_cmd(RCorePluginSession *cps, const char *input) {
 	RCore *core = cps->core;
 	if (!strcmp (input, "pd:?")) {
+#if R_LIB_ABIVERSION >= 125
+		r_cons_cmd_help_match (core->cons, r2ghidra_help, "pd:g", 0, false);
+#else
 		r_core_cmd_help_match (core, r2ghidra_help, (char*)"pd:g");
+#endif
 		return false;
 	}
 	if (r_str_startswith (input, "pd:g")) {
@@ -658,8 +751,26 @@ extern "C" bool r2ghidra_core_cmd(RCorePluginSession *cps, const char *input) {
 	return false;
 }
 
+bool ConfigCompiler(void *user, void *data) {
+	RCore *core = (RCore *) user;
+	std::lock_guard<R2GMutex> lock(decompiler_mutex);
+	auto node = reinterpret_cast<RConfigNode *>(data);
+	if (!strcmp (node->value, "?")) {
+		auto c = findGhidraCompiler (core, node->value);
+		// eprintf ("list compilers%c", 10);
+		return false;
+	} else {
+		auto c = findGhidraCompiler (core, node->value);
+		free (node->value);
+		node->value = strdup (c.c_str());
+		// eprintf ("%s%c", c.c_str(), 10);
+		// print c.c_str()
+	}
+	return true;
+}
+
 bool SleighHomeConfig(void */* user */, void *data) {
-	std::lock_guard<std::recursive_mutex> lock(decompiler_mutex);
+	std::lock_guard<R2GMutex> lock(decompiler_mutex);
 	RConfigNode *node = reinterpret_cast<RConfigNode *>(data);
 	SleighArchitecture::shutdown ();
 	SleighArchitecture::specpaths = FileManage ();
@@ -672,7 +783,7 @@ bool SleighHomeConfig(void */* user */, void *data) {
 extern "C" RArchPlugin r_arch_plugin_ghidra;
 
 extern "C" bool r2ghidra_core_init(RCorePluginSession *cps) {
-	std::lock_guard<std::recursive_mutex> lock(decompiler_mutex);
+	std::lock_guard<R2GMutex> lock(decompiler_mutex);
 	startDecompilerLibrary (nullptr);
 	RCore *core = reinterpret_cast<RCore *>(cps->core);
 	r_arch_plugin_add (core->anal->arch, &r_arch_plugin_ghidra);
@@ -689,8 +800,8 @@ extern "C" bool r2ghidra_core_init(RCorePluginSession *cps) {
 	return true;
 }
 
-extern "C" bool r2ghidra_core_fini(RCorePluginSession *cps, const char *cmd) {
-	std::lock_guard<std::recursive_mutex> lock (decompiler_mutex);
+extern "C" bool r2ghidra_core_fini(RCorePluginSession *cps) {
+	std::lock_guard<R2GMutex> lock (decompiler_mutex);
 	shutdownDecompilerLibrary ();
 	return true;
 }

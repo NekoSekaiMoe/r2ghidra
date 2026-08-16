@@ -3,8 +3,8 @@ project(
   ['c', 'cpp'],
   license : 'LGPL3',
   meson_version : '>=0.50.1',
-version : '6.1.4',
-  default_options : ['c_std=c11', 'cpp_std=c++20']
+  version : '6.2.0',
+  default_options : ['c_std=c11', 'cpp_std=c++20', 'b_vscrt=md']
 )
 
 
@@ -22,6 +22,7 @@ r2ghidra_sources = [
   'src/SleighAsm.cpp',
   'src/SleighInstruction.cpp',
   'src/PcodeFixupPreprocessor.cpp',
+  'src/r2harvest.cpp',
 ]
 
 incdirs = [
